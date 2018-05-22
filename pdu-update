@@ -3,7 +3,6 @@
 use strict;
 use warnings;
 
-use Carp;
 use URI;
 use Getopt::Std;
 use Net::OpenSSH;
@@ -37,7 +36,8 @@ $pdu_pass = $opt{P} if $opt{P};
 # Define a default, and then use -u if specified.
 #
 # NOTE: as of firmware 7.1c and 8.0k, only FTP is supported
-# on ServerTech PDUs as a firmware fetching protocol.
+# on ServerTech PDUs as a firmware fetching protocol. One day we might
+# get http/https as an option, hence the URI format.
 #
 my $url = 'ftp://ftp:pdu-update@10.66.128.19/pdu/sentry';
 $url = $opt{u} if $opt{u};
@@ -55,6 +55,7 @@ my $ftp_pass = $1 if $ftp_userinfo =~ /.*:(.*)/;
 my $ftp_server = $fw_url->host();
 my $ftp_path = $fw_url->path();
 
+# We expect to operate on at least one IP/hostname
 my @pdus;
 if (@ARGV) {
 	@pdus = @ARGV;
@@ -69,9 +70,17 @@ my $ip_validator = Data::Validate::IP->new;
 #
 foreach my $pdu_ip (@pdus) {
 
+	my %pdu_info;
+	my $ver_file;
+	my $cmd_file;
+	my @output;
+
+	my $restart_needed = undef;
+
 	# Resolve hostnames to IPs, and mke sure we get a valid IP.
 	unless ( $ip_validator->is_ipv4($pdu_ip) ) {
-		my $packed_ip = inet_aton($pdu_ip) or croak "could not resolve $pdu_ip";
+		my $packed_ip = inet_aton($pdu_ip)
+			or die "could not resolve " . $pdu_ip;
 		$pdu_ip = inet_ntoa($packed_ip);
 	}
 
@@ -81,15 +90,15 @@ foreach my $pdu_ip (@pdus) {
 	# options which OpenSSH has removed from its default set (read: they're
 	# bad crypto) so we initiate the OpenSSH object with options to enable
 	# them, as well as quiet the Host Key checking. We then initialize a
-	# Net::Telnet object and wire that over the OpenSSH's pty to issue
+	# Net::Telnet object and wire that over the OpenSSH pty to issue
 	# commands to the PDU's CLI.
 	my $ssh = Net::OpenSSH->new($pdu_ip, (
 		master_opts => [
-			-o => "KexAlgorithms=+diffie-hellman-group1-sha1",
-			-o => "HostKeyAlgorithms=+ssh-dss",
-			-o => "Ciphers=+aes256-cbc",
-			-o => "LogLevel=QUIET",
-			-o => "StrictHostKeyChecking=no"
+			-o => 'KexAlgorithms=+diffie-hellman-group1-sha1',
+			-o => 'HostKeyAlgorithms=+ssh-dss',
+			-o => 'Ciphers=+aes256-cbc',
+			-o => 'LogLevel=QUIET',
+			-o => 'StrictHostKeyChecking=no'
 			],
 		user => $pdu_user,
 		password => $pdu_pass
@@ -108,97 +117,133 @@ foreach my $pdu_ip (@pdus) {
 		Prompt  => '/Switched [CP]DU: /'
 	);
 
-	my %pdu_info;
-	my @output;
-
 	$telnet->waitfor($telnet->prompt);
 	@output = $telnet->cmd('set option more disabled')
 		or die "command failed: set option more disabled";
 
-	my $prompt = $telnet->last_prompt;
-
-	if ($prompt =~ /Switched PDU:/) {
-		$pdu_info{type} = "pro";
-	} elsif ($prompt =~ /Switched CDU:/)  {
-		$pdu_info{type} = "cdu";
-	} else {
-		die "FATAL: Could not determine PDU type!";
-	}
-
+	# Figure out what kind of ServerTech PDU model we are.
+	# PRO1/PRO2 and non-PRO PDU/CDUs are referred to differently:
+	# PRO1/PRO2 PDU = "PDU"
+	# Switched CDU = "CDU" (Cabinet Distribution Unit)
+	# We use this info to then set which firmware version file to check
+	# as well as which command file we may need to run, if asked to.
 	@output = $telnet->cmd('show system')
 		or die "command failed: show system";
 
 	foreach (@output) {
-		if (/^\s+F\/W Version:\s+Sentry Switched CDU Version (.*)/ ||
-		    /^\s+Firmware:\s+Sentry Switched PDU Version (.*)/) {
-			$pdu_info{fw_ver} = $1;
+		if (/.*\S:\s+Sentry Switched (PDU|CDU) Version (.*)/) {
+			my $type = $1;
+			$pdu_info{fw_ver} = $2;
+
+			if ($type eq 'PDU') {
+				$pdu_info{type} = "pro";
+				$ver_file = 'current-pro.txt';
+				$cmd_file = 'cmds-pro.txt';
+			} elsif ($type eq 'CDU')  {
+				$pdu_info{type} = "swcdu";
+				$ver_file = 'current-swcdu.txt';
+				$cmd_file = 'cmds-swcdu.txt';
+			} else {
+				die "FATAL: Could not determine PDU type!";
+			}
 		}
 	}
 
-	print "$pdu_ip is of type " . $pdu_info{type} . "\n";
+	print "$pdu_ip is of type " . uc($pdu_info{type}) . ", firmware " .
+		$pdu_info{fw_ver} . "\n";
 
 	# Connect to the firmware FTP server and GET either of
 	# current-swcdu.txt or current-pro.txt, and look at their
 	# contents to know what the current desired firmware version is
-	# for PRO or non-PRO PDUs. We use this info to see if we need to upgrade
-	# and, if so, to retrieve the desired firmware image.
+	# for PRO or non-PRO PDUs. We use this info to see if we need to
+	# upgrade and, if so, to retrieve the desired firmware image.
 	my $ftp = Net::FTP->new($ftp_server)
-		or die "Cannot connect: $@";
+		or die "FTP cannot connect: $@";
 
 	$ftp->login($ftp_user, $ftp_pass)
 		or die "FTP login failed: $@";
-
 	$ftp->passive(1)
 		or die "FTP set passive failed: $@";
-
 	$ftp->cwd($ftp_path)
 		or die "FTP chdir failed: $@";
 
+	# Create a temp file to store our retrieved version file
 	my $tmp = File::Temp->new(
 		TEMPLATE => 'tmpXXXXX',
 		DIR => '/tmp');
 
-	my $ver_file;
-	my $cmd_file;
-	if ($pdu_info{type} eq "cdu") {
-		$ver_file = 'current-swcdu.txt';
-		$cmd_file = 'cmds-swcdu.txt';
-	} elsif ($pdu_info{type} eq "pro") {
-		$ver_file = 'current-pro.txt';
-		$cmd_file = 'cmds-pro.txt';
-	}
-
-	# Save the retrieved version file to a File::Tmp file.
+	# Save the retrieved version file to the File::Tmp file and quit.
 	$ftp->get($ver_file, $tmp->filename)
-		or die "FTP could not fetch $ver_file: $@";
-
+		or die "FTP could not fetch " . $ver_file . ": $@";
 	$ftp->quit;
 
 	# Read the tmp file contents, store the version as a variable.
-	my $current_ver = slurp($tmp->filename);
-	chomp($current_ver);
-
+	# and then delete the Tmp::File.
+	my $wanted_ver = slurp($tmp->filename);
+	chomp($wanted_ver);
 	$tmp->DESTROY;
 
-	# Run any commands from command files if -c was specified
+	# Run any commands from command files if -c was specified. If the
+	# expected command file does not, this will die(). On ServerTech
+	# PDUs, it is sometimes required to restart the unit in order for
+	# a command to take (enabling/disabling things, etc). Generally,
+	# it will tell you after the command is ran if that is needed.
+	# We will look for 'Restart required to apply changes' and restart
+	# the PDU later if we observe that, even if there's no firmware update
+	# required.
 	if ($opt{c}) {
-		print "  Running commands in $cmd_file...\n";
-		my $cmds = slurp($cmd_file);
-		$telnet->print($cmds);
+		print "  Running commands in " . $cmd_file . "...\n";
+		my @cmds = split($/, slurp($cmd_file));
+
+		foreach my $cmd (@cmds) {
+			print "  Running: " . $cmd . "\n";
+			@output = $telnet->cmd($cmd);
+
+			print "  Output:\n";
+			foreach my $line (@output) {
+				chomp($line);
+				$restart_needed = 1 if $line =~ /Restart required to apply changes/;
+				$line =~ s/\s+$//g; # compact by trimming
+				print "    " . $line . "\n";
+			}
+		}
 	}
 
-	# See if we need to upgrade the PDU. Do so if yes.
-	if ($pdu_info{fw_ver} ne $current_ver) {
+	# See if we need to upgrade the PDU. Do so if yes. Doing so would
+	# initiate a reset of the PDU. Else, report that firmware is up to
+	# date, and check if any commands we ran flagged the unit for a
+	# restart and do that if needed. Restarting the PDU does NOT cut power!
+	if ($pdu_info{fw_ver} ne $wanted_ver) {
 		print "PDU FW out of date!\n" .
-			"  Has $pdu_info{fw_ver}, " .
-			"Want $current_ver\n"; 
+			"  Has " . $pdu_info{fw_ver} . ", " .
+			"Want ". $wanted_ver  . "\n";
 
-		update_fw(\%pdu_info, $current_ver, $telnet);
+		update_fw(\%pdu_info, $wanted_ver, $telnet);
 	} else {
-		print "$pdu_ip is up to date: $pdu_info{fw_ver}\n";
+		print $pdu_ip . " firmware is up to date: " .
+			$pdu_info{fw_ver} . "\n";
+
+		if ($restart_needed) {
+			print "Commands were ran which require" .
+				" the PDU be restarted. Restarting...\n";
+			$telnet->print('restart')
+				or die "cmd restart failed";
+
+			# Answer confirm restart yes/no prompt
+			# We need to pause for 2 seconds after answering
+			# because if we close the session too quickly, the
+			# restart process will abort.
+			$telnet->waitfor('/want to restart\?? \(Y\/es N\/o\): /')
+				or die "did not receive restart confirm prompt: " .
+					$telnet->lastline;
+			$telnet->print('y');
+			sleep 2;
+		} else {
+			print $pdu_ip . " no PDU restart required. Done.\n";
+		}
 	}
 
-	# Close down and go to the next PDU - or quite if no more.
+	# Close down and go to the next PDU - or quit if no more.
 	$telnet->close;
 	waitpid($pid, 0);
 }
@@ -208,7 +253,7 @@ foreach my $pdu_ip (@pdus) {
 #
 
 #
-# Sets up PDU with firmware FTP settings and initiates PDU reboot in order
+# Sets up PDU with firmware FTP settings and initiates PDU restart in order
 # to download and apply the new firmware.
 #
 sub update_fw {
@@ -224,7 +269,7 @@ sub update_fw {
 	$fw_ver =~ s/\.//;
 
 	my $fw_file;
-	if ($pdu_info{type} eq "cdu") {
+	if ($pdu_info{type} eq "swcdu") {
 		$fw_file = "swcdu-v" . $fw_ver . ".bin";
 	} elsif ($pdu_info{type} eq "pro") {
 		$fw_file = "pro-v" . $fw_ver . ".bin";
@@ -246,13 +291,13 @@ sub update_fw {
 
 
 	# Initiate firmware update with 'restart ftpload'
-	print "  Rebooting PDU to load new firmware...\n";
+	print "  Restarting PDU to load new firmware...\n";
 	$telnet->print('restart ftpload')
 		or die "cmd restart ftpload failed";
 
-	# Answer confirm reboot yes/no prompt
+	# Answer confirm restart yes/no prompt
 	# We need to pause for 2 seconds after answering because if we
-	# close the session too quickly, the reboot process will abort.
+	# close the session too quickly, the restart process will abort.
 	$telnet->waitfor('/want to restart\?? \(Y\/es N\/o\): /')
 		or die "did not receive restart confirm prompt: " .
 			$telnet->lastline;
@@ -280,7 +325,7 @@ sub slurp {
 #
 sub usage {
 	print STDERR << "EOF";
-Usage: $0 [-h] [-u url] [-U user] [-P password] pdu_ip ...
+Usage: $0 [-hc] [-u url] [-U user] [-P password] pdu_ip ...
 
 	-h	This help output
 	-c	Program the PDU with the contents of cmds-pro.txt or
