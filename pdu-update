@@ -288,16 +288,6 @@ sub process_apc {
 
 	my @output;
 
-	@output = $telnet->cmd('system')
-		or die "command failed: system";
-
-	foreach (@output) {
-		$pdu_info{fw_ver} = $1 if (/^AOS:\s+aos:v(.*)\s/);
-	}
-
-	die "FATAL: Could not determine PDU firmware version!"
-		unless $pdu_info{fw_ver};
-
 	@output = $telnet->cmd('about')
 		or die "command failed: about";
 
@@ -308,31 +298,56 @@ sub process_apc {
 	die "FATAL: Could not determine PDU model!"
 		unless $pdu_info{model};
 
+
+	@output = $telnet->cmd('system')
+		or die "command failed: system";
+
+	foreach (@output) {
+		$pdu_info{aos_ver} = $1 if (/^AOS:\s+aos:v(\S+)/);
+		$pdu_info{rpdu2g_ver} = $1 if (/^App:\s+rpdu2g:v(\S+)/);
+		$pdu_info{bootmon_ver} = $1 if (/^Bootmon:\s+bootmon:v(\S+)/);
+	}
+
+	die "FATAL: Could not determine PDU aos version!"
+		unless $pdu_info{aos_ver};
+	die "FATAL: Could not determine PDU app version!"
+		unless $pdu_info{rpdu2g_ver};
+	die "FATAL: Could not determine PDU bootmon version!"
+		unless $pdu_info{bootmon_ver};
+
 	print "$pdu_ip is of type " . uc($pdu_info{brand}) . " " .
-		uc($pdu_info{model}) . ", firmware " . $pdu_info{fw_ver} . "\n";
+		uc($pdu_info{model}) . ": " .
+		"AOS=" . $pdu_info{aos_ver} . ", " .
+		"App=" . $pdu_info{rpdu2g_ver} . ", " .
+		"Bootmon=" . $pdu_info{bootmon_ver} . "\n";
 
 	$ftp_path = "/pdu/apc/current-apc.txt";
 	$cmd_file = "cmds-apc.txt";
-
-	# Get our desired firmware version level from the FTP server
-	my $wanted_ver = get_current_ver($ftp_path);
 
 	# If -c was specified, run any command file
 	if ($opt{c}) {
 		$restart_needed = run_commands($cmd_file);
 	}
 
-	# See if we need to upgrade the PDU. Do so if yes. Doing so would
-	# initiate a reset of the PDU. Else, report that firmware is up to
-	# date, and check if any commands we ran flagged the unit for a
-	# restart and do that if needed. Restarting the PDU does NOT cut power!
-	if ($pdu_info{fw_ver} ne $wanted_ver) {
-		print "PDU FW out of date!\n" .
-			"  Has $pdu_info{fw_ver}, Want $wanted_ver\n";
-		update_apc_fw($wanted_ver);
-	} else {
-		print "$pdu_ip firmware is up to date: " .
-			$pdu_info{fw_ver} . "\n";
+	# Get our desired firmware version level from the FTP server
+	my @wanted_ver = split(/^/, get_current_ver($ftp_path));
+
+	foreach (@wanted_ver) {
+		$pdu_info{aos_ver_want} = $1 if (/^aos=(\S+)$/);
+		$pdu_info{rpdu2g_ver_want} = $1 if (/^rpdu2g=(\S+)$/);
+		$pdu_info{bootmon_ver_want} = $1 if (/^bootmon=(\S+)$/);
+	}
+
+	foreach my $fw_type (qw / aos rpdu2g bootmon /) {
+		my $have = $fw_type . "_ver";
+		my $want = $fw_type . "_ver_want";
+
+		if ($pdu_info{$have} ne $pdu_info{$want}) {
+			update_apc_fw($fw_type, $pdu_info{$want});
+		} else {
+			print "$pdu_ip $fw_type firmware is up to date: " .
+				"$pdu_info{$have}\n";
+		}
 	}
 }
 
@@ -340,9 +355,10 @@ sub process_apc {
 # Sets up PDU to get new firmware
 #
 sub update_apc_fw {
+	my $fw_type = shift;
 	my $fw_ver = shift;
 
-	print "APC PDU firmware updates not implemented yet\n";
+	print "Updating $fw_type to $fw_ver\n";
 }
 
 #
