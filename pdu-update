@@ -55,7 +55,7 @@ our $ssh;
 our $telnet;
 our %pdu_info;
 
-my $opts = 'chu:U:P:';
+my $opts = 'chnu:U:P:';
 getopts("$opts", \%opt) or usage();
 usage() if $opt{h};
 
